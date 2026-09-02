@@ -1,0 +1,508 @@
+using System.Collections.ObjectModel;
+using Microsoft.Win32.TaskScheduler;
+using optimizerDuck.Domain.Execution;
+using optimizerDuck.Domain.Revert.Steps;
+using optimizerDuck.Resources.Languages;
+using optimizerDuck.Services.UI;
+using ScheduledTaskModel = optimizerDuck.Domain.Optimizations.Models.ScheduledTask.ScheduledTaskModel;
+using Task = Microsoft.Win32.TaskScheduler.Task;
+
+namespace optimizerDuck.Services.Optimization.Providers;
+
+public static class ScheduledTaskService
+{
+    private static readonly AsyncLocal<string?> _lastError = new();
+    private static readonly AsyncLocal<string?> _lastErrorDetail = new();
+
+    internal static string? LastError => _lastError.Value;
+    internal static string? LastErrorDetail => _lastErrorDetail.Value;
+
+    /// <summary>Checks whether a task at the given full path exists and is enabled.</summary>
+    public static bool IsTaskEnabled(string fullPath)
+    {
+        try
+        {
+            using var ts = new TaskService();
+            var task = ts.GetTask(fullPath);
+            return task is { Enabled: true };
+        }
+        catch (Exception ex)
+        {
+            ExecutionScope.LogDebug(
+                "Failed to check task enabled state {Path}: {Error}",
+                fullPath,
+                ex.Message
+            );
+            return false;
+        }
+    }
+
+    /// <summary>Disables a scheduled task.</summary>
+    /// <param name="fullPath">The full path of the task to disable.</param>
+    /// <returns><see langword="true" /> if the task was disabled; otherwise, <see langword="false" />.</returns>
+    public static bool DisableTask(string fullPath)
+    {
+        _lastError.Value = _lastErrorDetail.Value = null;
+
+        var description = string.Format(
+            Translations.Service_ScheduledTask_Description_Disable,
+            fullPath
+        );
+        try
+        {
+            using var ts = new TaskService();
+            var task =
+                ts.GetTask(fullPath)
+                ?? throw new InvalidOperationException(
+                    string.Format(Translations.ScheduledTasks_Error_TaskNotFound, fullPath)
+                );
+
+            var wasEnabled = task.Enabled;
+            task.Enabled = false;
+
+            // Record revert step: restore to previous enabled state
+            ScheduledTaskRevertStep? revertStep = null;
+            if (wasEnabled)
+                revertStep = new ScheduledTaskRevertStep
+                {
+                    FullPath = fullPath,
+                    OriginalEnabled = true,
+                };
+
+            ExecutionScope.LogInfo("Disabled task {Path}", fullPath);
+            ExecutionScope.Track(nameof(DisableTask), true);
+            ExecutionScope.RecordStep(
+                Translations.Service_ScheduledTask_Name,
+                description,
+                true,
+                revertStep
+            );
+            return true;
+        }
+        catch (UnauthorizedAccessException)
+        {
+            _lastError.Value = Translations.Service_Common_Error_AccessDenied;
+            _lastErrorDetail.Value = string.Format(
+                Translations.Service_ScheduledTask_ErrorDetail_AccessDeniedDisable,
+                fullPath
+            );
+            ExecutionScope.LogError(null, "Access denied disabling task {Path}", fullPath);
+            ExecutionScope.Track(nameof(DisableTask), false);
+            ExecutionScope.RecordStep(
+                Translations.Service_ScheduledTask_Name,
+                description,
+                false,
+                null,
+                _lastError.Value,
+                () => global::System.Threading.Tasks.Task.FromResult(DisableTask(fullPath)),
+                _lastErrorDetail.Value
+            );
+            return false;
+        }
+        catch (Exception ex)
+        {
+            _lastError.Value = ex.Message;
+            _lastErrorDetail.Value = ex.ToString();
+            ExecutionScope.LogError(ex, "Failed to disable task {Path}", fullPath);
+            ExecutionScope.Track(nameof(DisableTask), false);
+            ExecutionScope.RecordStep(
+                Translations.Service_ScheduledTask_Name,
+                description,
+                false,
+                null,
+                _lastError.Value,
+                () => global::System.Threading.Tasks.Task.FromResult(DisableTask(fullPath)),
+                _lastErrorDetail.Value
+            );
+            return false;
+        }
+    }
+
+    /// <summary>Enables a scheduled task.</summary>
+    /// <param name="fullPath">The full path of the task to enable.</param>
+    /// <returns><see langword="true" /> if the task was enabled; otherwise, <see langword="false" />.</returns>
+    public static bool EnableTask(string fullPath)
+    {
+        _lastError.Value = _lastErrorDetail.Value = null;
+
+        var description = string.Format(
+            Translations.Service_ScheduledTask_Description_Enable,
+            fullPath
+        );
+        try
+        {
+            using var ts = new TaskService();
+            var task =
+                ts.GetTask(fullPath)
+                ?? throw new InvalidOperationException(
+                    string.Format(Translations.ScheduledTasks_Error_TaskNotFound, fullPath)
+                );
+
+            var wasEnabled = task.Enabled;
+            task.Enabled = true;
+
+            // Record revert step: restore to previous enabled state
+            ScheduledTaskRevertStep? revertStep = null;
+            if (!wasEnabled)
+                revertStep = new ScheduledTaskRevertStep
+                {
+                    FullPath = fullPath,
+                    OriginalEnabled = false,
+                };
+
+            ExecutionScope.LogInfo("Enabled task {Path}", fullPath);
+            ExecutionScope.Track(nameof(EnableTask), true);
+            ExecutionScope.RecordStep(
+                Translations.Service_ScheduledTask_Name,
+                description,
+                true,
+                revertStep
+            );
+            return true;
+        }
+        catch (UnauthorizedAccessException)
+        {
+            _lastError.Value = Translations.Service_Common_Error_AccessDenied;
+            _lastErrorDetail.Value = string.Format(
+                Translations.Service_ScheduledTask_ErrorDetail_AccessDeniedEnable,
+                fullPath
+            );
+            ExecutionScope.LogError(null, "Access denied enabling task {Path}", fullPath);
+            ExecutionScope.Track(nameof(EnableTask), false);
+            ExecutionScope.RecordStep(
+                Translations.Service_ScheduledTask_Name,
+                description,
+                false,
+                null,
+                _lastError.Value,
+                () => global::System.Threading.Tasks.Task.FromResult(EnableTask(fullPath)),
+                _lastErrorDetail.Value
+            );
+            return false;
+        }
+        catch (Exception ex)
+        {
+            _lastError.Value = ex.Message;
+            _lastErrorDetail.Value = ex.ToString();
+            ExecutionScope.LogError(ex, "Failed to enable task {Path}", fullPath);
+            ExecutionScope.Track(nameof(EnableTask), false);
+            ExecutionScope.RecordStep(
+                Translations.Service_ScheduledTask_Name,
+                description,
+                false,
+                null,
+                _lastError.Value,
+                () => global::System.Threading.Tasks.Task.FromResult(EnableTask(fullPath)),
+                _lastErrorDetail.Value
+            );
+            return false;
+        }
+    }
+
+    /// <summary>Retrieves all scheduled tasks from the system, including icon extraction.</summary>
+    /// <returns>A list of all scheduled tasks.</returns>
+    public static List<ScheduledTaskModel> GetAllTasks()
+    {
+        var results = new List<ScheduledTaskModel>();
+        try
+        {
+            using var ts = new TaskService();
+            CollectTasks(ts.RootFolder, results);
+
+            // Extract icons from task commands
+            Parallel.ForEach(
+                results,
+                new ParallelOptions { MaxDegreeOfParallelism = Environment.ProcessorCount },
+                task =>
+                {
+                    if (!string.IsNullOrWhiteSpace(task.ActionSummary))
+                        task.LogoImage = StartupManagerService.ExtractIcon(task.ActionSummary);
+                }
+            );
+        }
+        catch (Exception ex)
+        {
+            ExecutionScope.LogError(ex, "Failed to enumerate scheduled tasks");
+        }
+
+        return results;
+    }
+
+    /// <summary>Returns startup-related tasks: those with a LogonTrigger or BootTrigger.</summary>
+    /// <returns>A list of startup-related tasks ordered by name.</returns>
+    public static List<ScheduledTaskModel> GetStartupTasks()
+    {
+        return GetAllTasks()
+            .Where(t => t.HasLogonTrigger || t.HasBootTrigger)
+            .OrderBy(t => t.Name)
+            .ToList();
+    }
+
+    /// <summary>Runs a scheduled task immediately.</summary>
+    /// <param name="fullPath">The full path of the task to run.</param>
+    /// <returns><see langword="true" /> if the task was started; otherwise, <see langword="false" />.</returns>
+    public static bool RunTask(string fullPath)
+    {
+        _lastError.Value = _lastErrorDetail.Value = null;
+
+        try
+        {
+            using var ts = new TaskService();
+            var task =
+                ts.GetTask(fullPath)
+                ?? throw new InvalidOperationException(
+                    string.Format(Translations.ScheduledTasks_Error_TaskNotFound, fullPath)
+                );
+            task.Run();
+            ExecutionScope.LogInfo("Started task {Path}", fullPath);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            _lastError.Value = ex.Message;
+            _lastErrorDetail.Value = ex.ToString();
+            ExecutionScope.LogError(ex, "Failed to run task {Path}", fullPath);
+            return false;
+        }
+    }
+
+    /// <summary>Stops a running scheduled task.</summary>
+    /// <param name="fullPath">The full path of the task to stop.</param>
+    /// <returns><see langword="true" /> if the task was stopped; otherwise, <see langword="false" />.</returns>
+    public static bool StopTask(string fullPath)
+    {
+        _lastError.Value = _lastErrorDetail.Value = null;
+
+        try
+        {
+            using var ts = new TaskService();
+            var task =
+                ts.GetTask(fullPath)
+                ?? throw new InvalidOperationException(
+                    string.Format(Translations.ScheduledTasks_Error_TaskNotFound, fullPath)
+                );
+            task.Stop();
+            ExecutionScope.LogInfo("Stopped task {Path}", fullPath);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            _lastError.Value = ex.Message;
+            _lastErrorDetail.Value = ex.ToString();
+            ExecutionScope.LogError(ex, "Failed to stop task {Path}", fullPath);
+            return false;
+        }
+    }
+
+    /// <summary>Gets the current state string of a task.</summary>
+    /// <param name="fullPath">The full path of the task.</param>
+    /// <returns>The task state string, or <see langword="null" /> if the task is not found or an error occurs.</returns>
+    public static string? GetTaskState(string fullPath)
+    {
+        try
+        {
+            using var ts = new TaskService();
+            var task = ts.GetTask(fullPath);
+            return task?.State.ToString();
+        }
+        catch (Exception ex)
+        {
+            ExecutionScope.LogDebug(
+                "Failed to get state for task {Path}: {Error}",
+                fullPath,
+                ex.Message
+            );
+            return null;
+        }
+    }
+
+    /// <summary>Deletes a scheduled task.</summary>
+    /// <param name="fullPath">The full path of the task to delete.</param>
+    /// <returns><see langword="true" /> if the task was deleted; otherwise, <see langword="false" />.</returns>
+    public static bool DeleteTask(string fullPath)
+    {
+        _lastError.Value = _lastErrorDetail.Value = null;
+
+        try
+        {
+            using var ts = new TaskService();
+            var task =
+                ts.GetTask(fullPath)
+                ?? throw new InvalidOperationException(
+                    string.Format(Translations.ScheduledTasks_Error_TaskNotFound, fullPath)
+                );
+            var folderPath = task.Folder.Path;
+            ts.GetFolder(folderPath).DeleteTask(task.Name);
+            ExecutionScope.LogInfo("Deleted task {Path}", fullPath);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            _lastError.Value = ex.Message;
+            _lastErrorDetail.Value = ex.ToString();
+            ExecutionScope.LogError(ex, "Failed to delete task {Path}", fullPath);
+            return false;
+        }
+    }
+
+    /// <summary>[WIP] Registers a new scheduled task from a model definition.</summary>
+    /// <param name="folderPath">The target folder path (e.g. <c>\MyApp</c>).</param>
+    /// <param name="model">The task definition model.</param>
+    /// <exception cref="InvalidOperationException">Failed to create a registry subkey during registration.</exception>
+    public static void RegisterTask(string folderPath, ScheduledTaskModel model)
+    {
+        try
+        {
+            using var ts = new TaskService();
+            var td = ts.NewTask();
+            td.RegistrationInfo.Description = model.Description ?? string.Empty;
+            td.RegistrationInfo.Author = model.Author ?? string.Empty;
+            td.Settings.Enabled = model.IsEnabled;
+            td.Settings.Hidden = model.Hidden;
+
+            if (model.RunWithHighestPrivileges)
+                td.Principal.RunLevel = TaskRunLevel.Highest;
+
+            // Handle Action Execution accurately
+            if (!string.IsNullOrWhiteSpace(model.ExecutablePath))
+            {
+                var action = new ExecAction(model.ExecutablePath);
+                if (!string.IsNullOrWhiteSpace(model.Arguments))
+                    action.Arguments = model.Arguments;
+                td.Actions.Add(action);
+            }
+            else if (!string.IsNullOrWhiteSpace(model.ActionSummary)) // Fallback if still populated via old approach
+            {
+                var parts = model.ActionSummary.Trim();
+                var spaceIdx = parts.IndexOf(' ');
+                if (spaceIdx > 0)
+                    td.Actions.Add(new ExecAction(parts[..spaceIdx], parts[(spaceIdx + 1)..]));
+                else
+                    td.Actions.Add(new ExecAction(parts));
+            }
+
+            // Add triggers based on model flags
+            if (model.HasLogonTrigger)
+                td.Triggers.Add(new LogonTrigger());
+            if (model.HasBootTrigger)
+                td.Triggers.Add(new BootTrigger());
+            if (model.HasIdleTrigger)
+                td.Triggers.Add(new IdleTrigger());
+            if (model.HasRegistrationTrigger)
+                td.Triggers.Add(new RegistrationTrigger());
+            if (model.HasDailyTrigger)
+                td.Triggers.Add(
+                    new DailyTrigger { StartBoundary = DateTime.Today + model.DailyTriggerTime }
+                );
+
+            // Ensure folder exists
+            var folder = ts.RootFolder;
+            if (!string.IsNullOrWhiteSpace(folderPath) && folderPath != "\\")
+                try
+                {
+                    folder = ts.GetFolder(folderPath);
+                }
+                catch
+                {
+                    folder = ts.RootFolder.CreateFolder(folderPath);
+                }
+
+            folder.RegisterTaskDefinition(model.Name, td);
+            ExecutionScope.LogInfo(
+                "Registered task {Name} in folder {Folder}",
+                model.Name,
+                folderPath
+            );
+        }
+        catch (Exception ex)
+        {
+            ExecutionScope.LogError(
+                ex,
+                "Failed to register task {Name} in {Folder}",
+                model.Name,
+                folderPath
+            );
+            throw;
+        }
+    }
+
+    #region Helpers
+
+    private static void CollectTasks(TaskFolder folder, List<ScheduledTaskModel> results)
+    {
+        try
+        {
+            foreach (var task in folder.Tasks)
+                try
+                {
+                    results.Add(MapTaskToModel(task));
+                }
+                catch (Exception ex)
+                {
+                    ExecutionScope.LogDebug(
+                        "Failed to map task {Name}: {Error}",
+                        task.Name,
+                        ex.Message
+                    );
+                }
+
+            foreach (var subFolder in folder.SubFolders)
+                CollectTasks(subFolder, results);
+        }
+        catch (Exception ex)
+        {
+            ExecutionScope.LogDebug(
+                "Failed to enumerate folder {Path}: {Error}",
+                folder.Path,
+                ex.Message
+            );
+        }
+    }
+
+    private static ScheduledTaskModel MapTaskToModel(Task task)
+    {
+        var def = task.Definition;
+        var triggers = def.Triggers;
+        var actions = def.Actions;
+
+        var triggerDescriptions = new List<string>();
+        var hasLogon = false;
+        var hasBoot = false;
+
+        foreach (var t in triggers)
+        {
+            triggerDescriptions.Add(t.ToString() ?? t.TriggerType.ToString());
+            if (t.TriggerType == TaskTriggerType.Logon)
+                hasLogon = true;
+            if (t.TriggerType == TaskTriggerType.Boot)
+                hasBoot = true;
+        }
+
+        var actionSummary = string.Empty;
+        if (actions.Count > 0 && actions[0] is ExecAction exec)
+            actionSummary = string.IsNullOrWhiteSpace(exec.Arguments)
+                ? exec.Path ?? string.Empty
+                : $"{exec.Path} {exec.Arguments}";
+
+        return new ScheduledTaskModel
+        {
+            Name = task.Name,
+            Path = task.Folder.Path,
+            FullPath = task.Path,
+            Description = def.RegistrationInfo.Description,
+            Author = def.RegistrationInfo.Author,
+            IsEnabled = task.Enabled,
+            State = task.State.ToString(),
+            TriggerSummary = string.Join("; ", triggerDescriptions),
+            TriggerTypes = new ObservableCollection<string>(triggerDescriptions),
+            ActionSummary = actionSummary,
+            LastRunTime = task.LastRunTime == DateTime.MinValue ? null : task.LastRunTime,
+            NextRunTime = task.NextRunTime == DateTime.MinValue ? null : task.NextRunTime,
+            LastRunResult = task.LastTaskResult,
+            HasLogonTrigger = hasLogon,
+            HasBootTrigger = hasBoot,
+        };
+    }
+
+    #endregion Helpers
+}

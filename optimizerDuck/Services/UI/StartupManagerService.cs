@@ -1,0 +1,543 @@
+using System.Diagnostics;
+using System.Drawing;
+using System.IO;
+using System.Runtime.InteropServices;
+using System.Windows;
+using System.Windows.Interop;
+using System.Windows.Media.Imaging;
+using Microsoft.Extensions.Logging;
+using Microsoft.Win32;
+using optimizerDuck.Domain.Optimizations.Models.StartupManager;
+using optimizerDuck.Services.Optimization.Providers;
+using StartupApp = optimizerDuck.Domain.Optimizations.Models.StartupManager.StartupApp;
+using StartupTask = optimizerDuck.Domain.Optimizations.Models.StartupManager.StartupTask;
+
+namespace optimizerDuck.Services.UI;
+
+public class StartupManagerService(ILogger<StartupManagerService> logger)
+{
+    /// <summary>Retrieves all startup applications from registry Run/RunOnce keys and startup folders, including their enabled state and icons.</summary>
+    /// <returns>A list of <see cref="StartupApp"/> instances sorted by name.</returns>
+    public async Task<List<StartupApp>> GetStartupAppsAsync()
+    {
+        var apps = new List<StartupApp>();
+
+        await Task.Run(() =>
+        {
+            // 1. Registry
+            ScanRegistryKey(
+                Registry.CurrentUser,
+                @"Software\Microsoft\Windows\CurrentVersion\Run",
+                StartupAppLocation.RegistryHKCURun,
+                apps
+            );
+            ScanRegistryKey(
+                Registry.LocalMachine,
+                @"Software\Microsoft\Windows\CurrentVersion\Run",
+                StartupAppLocation.RegistryHKLMRun,
+                apps
+            );
+            ScanRegistryKey(
+                Registry.CurrentUser,
+                @"Software\Microsoft\Windows\CurrentVersion\RunOnce",
+                StartupAppLocation.RegistryHKCURunOnce,
+                apps
+            );
+            ScanRegistryKey(
+                Registry.LocalMachine,
+                @"Software\Microsoft\Windows\CurrentVersion\RunOnce",
+                StartupAppLocation.RegistryHKLMRunOnce,
+                apps
+            );
+
+            // 2. Startup Folders
+            var userStartup = Environment.GetFolderPath(Environment.SpecialFolder.Startup);
+            var commonStartup = Environment.GetFolderPath(Environment.SpecialFolder.CommonStartup);
+
+            ScanDirectory(userStartup, StartupAppLocation.UserStartupFolder, apps);
+            ScanDirectory(commonStartup, StartupAppLocation.CommonStartupFolder, apps);
+
+            // Parallel fetch expensive info (Icons, File version info)
+            Parallel.ForEach(
+                apps,
+                new ParallelOptions { MaxDegreeOfParallelism = Environment.ProcessorCount },
+                app =>
+                {
+                    var appInfo = GetAppInfo(app.Command);
+                    var publisher = !string.IsNullOrWhiteSpace(appInfo.Publisher)
+                        ? appInfo.Publisher
+                        : appInfo.Description;
+                    if (string.IsNullOrWhiteSpace(publisher))
+                        publisher = app.Location
+                            is StartupAppLocation.UserStartupFolder
+                                or StartupAppLocation.CommonStartupFolder
+                            ? "Folder Shortcut"
+                            : "Registry";
+
+                    app.Publisher = publisher;
+                    app.FilePath = appInfo.FilePath;
+                    app.LogoImage = ExtractIcon(app.Command);
+                }
+            );
+        });
+
+        logger.LogInformation("Retrieved {Count} startup apps", apps.Count);
+
+        return apps.OrderBy(a => a.Name).ToList();
+    }
+
+    private void ScanRegistryKey(
+        RegistryKey rootKey,
+        string subKeyPath,
+        StartupAppLocation location,
+        List<StartupApp> apps
+    )
+    {
+        try
+        {
+            using var key = rootKey.OpenSubKey(subKeyPath);
+            if (key == null)
+                return;
+
+            // Determine the StartupApproved path based on Run vs RunOnce
+            var approvedSubKeyPath = subKeyPath.Contains(
+                "RunOnce",
+                StringComparison.OrdinalIgnoreCase
+            )
+                ? @"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\RunOnce"
+                : @"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run";
+
+            using var approvedKey = rootKey.OpenSubKey(approvedSubKeyPath);
+
+            foreach (var valueName in key.GetValueNames())
+            {
+                var command = key.GetValue(valueName)?.ToString() ?? string.Empty;
+                var isEnabled = IsStartupApproved(approvedKey, valueName);
+
+                apps.Add(
+                    new StartupApp
+                    {
+                        Name = valueName,
+                        Command = command,
+                        Location = location,
+                        PathOrKey = $@"{rootKey.Name}\{subKeyPath}",
+                        OriginalValueNameOrFileName = valueName,
+                        IsEnabled = isEnabled,
+                    }
+                );
+            }
+        }
+        catch (Exception ex)
+        {
+            logger.LogError(ex, "Failed to scan registry startup: {Path}", subKeyPath);
+        }
+    }
+
+    /// <summary>
+    ///     Checks the StartupApproved registry to determine if an item is enabled.
+    ///     The binary data format: bytes[0] == 02 or 06 means enabled; 03 or 07 means disabled.
+    ///     If no entry exists in StartupApproved, assume enabled (item is present in Run key).
+    /// </summary>
+    private static bool IsStartupApproved(RegistryKey? approvedKey, string valueName)
+    {
+        if (approvedKey == null)
+            return true;
+
+        try
+        {
+            if (approvedKey.GetValue(valueName) is byte[] { Length: >= 4 } data)
+                // Disabled flags: 03, 07; Enabled flags: 02, 06
+                return data[0] != 0x03 && data[0] != 0x07;
+        }
+        catch
+        {
+            // Ignore read errors, fall back to enabled
+        }
+
+        return true;
+    }
+
+    private void ScanDirectory(string dirPath, StartupAppLocation location, List<StartupApp> apps)
+    {
+        if (string.IsNullOrWhiteSpace(dirPath) || !Directory.Exists(dirPath))
+            return;
+
+        try
+        {
+            // Determine registry root key based on folder location
+            var rootKey =
+                location == StartupAppLocation.CommonStartupFolder
+                    ? Registry.LocalMachine
+                    : Registry.CurrentUser;
+
+            const string approvedSubKeyPath =
+                @"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\StartupFolder";
+            using var approvedKey = rootKey.OpenSubKey(approvedSubKeyPath);
+
+            foreach (var file in Directory.GetFiles(dirPath))
+            {
+                var fileName = Path.GetFileName(file);
+
+                // Hide pure .ini files like desktop.ini
+                if (fileName.Equals("desktop.ini", StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                var isEnabled = IsStartupApproved(approvedKey, fileName);
+                var name = Path.GetFileNameWithoutExtension(fileName);
+
+                apps.Add(
+                    new StartupApp
+                    {
+                        Name = string.IsNullOrWhiteSpace(name) ? fileName : name,
+                        Command = file,
+                        Location = location,
+                        PathOrKey = dirPath,
+                        OriginalValueNameOrFileName = fileName,
+                        IsEnabled = isEnabled,
+                    }
+                );
+            }
+        }
+        catch (Exception ex)
+        {
+            logger.LogError(ex, "Failed to scan directory: {Dir}", dirPath);
+        }
+    }
+
+    /// <summary>Enables or disables a startup application by writing the StartupApproved registry flag.</summary>
+    /// <param name="app">The startup app to toggle.</param>
+    /// <param name="enable"><see langword="true"/> to enable, <see langword="false"/> to disable.</param>
+    public async Task ToggleStartupApp(StartupApp app, bool enable)
+    {
+        await Task.Run(() =>
+        {
+            try
+            {
+                if (
+                    app.Location
+                    is StartupAppLocation.RegistryHKCURun
+                        or StartupAppLocation.RegistryHKLMRun
+                        or StartupAppLocation.RegistryHKCURunOnce
+                        or StartupAppLocation.RegistryHKLMRunOnce
+                )
+                    ToggleRegistryStartupApp(app, enable);
+                else // Folders
+                    ToggleFolderStartupApp(app, enable);
+
+                logger.LogInformation("Toggled startup app {Name} to {Enable}", app.Name, enable);
+            }
+            catch (Exception ex)
+            {
+                logger.LogError(ex, "Failed to toggle startup app {Name}", app.Name);
+            }
+        });
+    }
+
+    private static void ToggleRegistryStartupApp(StartupApp app, bool enable)
+    {
+        // Parse RootKey and SubKey from app.PathOrKey
+        var firstSlash = app.PathOrKey.IndexOf('\\');
+        if (firstSlash < 0)
+            return;
+
+        var rootKeyStr = app.PathOrKey[..firstSlash];
+        var rootKey = rootKeyStr switch
+        {
+            "HKEY_CURRENT_USER" => Registry.CurrentUser,
+            "HKEY_LOCAL_MACHINE" => Registry.LocalMachine,
+            _ => null,
+        };
+        if (rootKey == null)
+            return;
+
+        // Write enable/disable to StartupApproved\Run
+        var isRunOnce =
+            app.Location
+            is StartupAppLocation.RegistryHKCURunOnce
+                or StartupAppLocation.RegistryHKLMRunOnce;
+        var approvedSubKeyPath = isRunOnce
+            ? @"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\RunOnce"
+            : @"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run";
+
+        using var approvedKey =
+            rootKey.OpenSubKey(approvedSubKeyPath, true)
+            ?? rootKey.CreateSubKey(approvedSubKeyPath, true);
+
+        // Binary format: 12 bytes. First 4 bytes = status flag, rest = timestamp (zeros for manual toggle)
+        var data = new byte[12];
+        data[0] = enable ? (byte)0x02 : (byte)0x03;
+        approvedKey.SetValue(app.OriginalValueNameOrFileName, data, RegistryValueKind.Binary);
+    }
+
+    private static void ToggleFolderStartupApp(StartupApp app, bool enable)
+    {
+        var rootKey =
+            app.Location == StartupAppLocation.CommonStartupFolder
+                ? Registry.LocalMachine
+                : Registry.CurrentUser;
+
+        const string approvedSubKeyPath =
+            @"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\StartupFolder";
+        using var approvedKey =
+            rootKey.OpenSubKey(approvedSubKeyPath, true)
+            ?? rootKey.CreateSubKey(approvedSubKeyPath, true);
+
+        var data = new byte[12];
+        data[0] = enable ? (byte)0x02 : (byte)0x03;
+        approvedKey.SetValue(app.OriginalValueNameOrFileName, data, RegistryValueKind.Binary);
+    }
+
+    /// <summary>Retrieves all startup scheduled tasks from the Windows Task Scheduler, including their enabled state and icons.</summary>
+    /// <returns>A list of <see cref="StartupTask"/> instances sorted by name.</returns>
+    public Task<List<StartupTask>> GetStartupTasksAsync()
+    {
+        return Task.Run(() =>
+        {
+            try
+            {
+                var models = ScheduledTaskService.GetStartupTasks();
+                var tasks = models
+                    .Select(m => new StartupTask
+                    {
+                        TaskName = m.Name,
+                        TaskPath = m.Path,
+                        Description = m.Description,
+                        TriggerSummary = m.TriggerSummary,
+                        TriggerTypes = [.. m.TriggerTypes],
+                        ActionSummary = m.ActionSummary,
+                        IsEnabled = m.IsEnabled,
+                    })
+                    .OrderBy(t => t.TaskName)
+                    .ToList();
+
+                // Extract icons from task commands
+                Parallel.ForEach(
+                    tasks,
+                    new ParallelOptions { MaxDegreeOfParallelism = Environment.ProcessorCount },
+                    task =>
+                    {
+                        if (!string.IsNullOrWhiteSpace(task.ActionSummary))
+                            task.LogoImage = ExtractIcon(task.ActionSummary);
+                    }
+                );
+
+                return tasks;
+            }
+            catch (Exception ex)
+            {
+                logger.LogError(ex, "Failed to get scheduled tasks");
+                return [];
+            }
+        });
+    }
+
+    /// <summary>Enables or disables a startup scheduled task using the Task Scheduler API.</summary>
+    /// <param name="task">The startup task to toggle.</param>
+    /// <param name="enable"><see langword="true"/> to enable, <see langword="false"/> to disable.</param>
+    public Task ToggleStartupTask(StartupTask task, bool enable)
+    {
+        return Task.Run(() =>
+        {
+            try
+            {
+                var fullPath = task.TaskPath.TrimEnd('\\') + "\\" + task.TaskName;
+                if (enable)
+                {
+                    ScheduledTaskService.EnableTask(fullPath);
+                    logger.LogInformation("Enabled task {Name} ({Path})", task.TaskName, fullPath);
+                }
+                else
+                {
+                    ScheduledTaskService.DisableTask(fullPath);
+                    logger.LogInformation("Disabled task {Name} ({Path})", task.TaskName, fullPath);
+                }
+            }
+            catch (Exception ex)
+            {
+                logger.LogError(ex, "Failed to toggle task {Name}", task.TaskName);
+            }
+        });
+    }
+
+    /// <summary>Extracts the associated icon from an executable path or command string. Expands environment variables and searches PATH if needed.</summary>
+    /// <param name="command">The command or file path to extract the icon from.</param>
+    /// <returns>A frozen <see cref="BitmapSource"/> suitable for cross-thread UI binding, or <see langword="null"/> if the icon cannot be extracted.</returns>
+    /// <remarks>
+    ///     Uses <c>SHGetFileInfo</c> with <c>SHGFI_LARGEICON</c> (48x48) for higher quality icons
+    ///     where possible, falling back to <see cref="Icon.ExtractAssociatedIcon"/> (32x32) if the
+    ///     P/Invoke approach fails.
+    /// </remarks>
+    public static BitmapSource? ExtractIcon(string command)
+    {
+        try
+        {
+            var path = ResolveExecutablePath(command);
+            if (path == null)
+                return null;
+
+            var iconSource = ExtractIconWithShGetFileInfo(path);
+            if (iconSource != null)
+                return iconSource;
+
+            // fallback to ExtractAssociatedIcon (32x32)
+            using var icon = Icon.ExtractAssociatedIcon(path);
+            if (icon != null)
+            {
+                var imageSource = Imaging.CreateBitmapSourceFromHIcon(
+                    icon.Handle,
+                    Int32Rect.Empty,
+                    BitmapSizeOptions.FromEmptyOptions()
+                );
+                imageSource.Freeze();
+                return imageSource;
+            }
+        }
+        catch
+        {
+            // ignored, fallback to generic or null
+        }
+
+        return null;
+    }
+
+    private static string? ResolveExecutablePath(string command)
+    {
+        var path = command.Trim('\"');
+
+        // expand environment variables (e.g., %USERPROFILE%, %ProgramFiles%)
+        path = Environment.ExpandEnvironmentVariables(path);
+        var exeIdx = path.IndexOf(".exe", StringComparison.OrdinalIgnoreCase);
+        if (exeIdx > 0)
+            path = path[..(exeIdx + 4)].Trim('\"', ' ', '\'');
+
+        if (!File.Exists(path))
+        {
+            // try to see if it is in PATH
+            if (!path.Contains('\\') && !path.Contains('/'))
+            {
+                path = GetFullPathFromEnvironment(path);
+                if (string.IsNullOrEmpty(path) || !File.Exists(path))
+                    return null;
+            }
+            else
+            {
+                return null;
+            }
+        }
+
+        return path;
+    }
+
+    [DllImport("shell32.dll", CharSet = CharSet.Auto)]
+    private static extern IntPtr SHGetFileInfo(
+        string pszPath,
+        uint dwFileAttributes,
+        ref SHFILEINFO psfi,
+        uint cbFileInfo,
+        uint uFlags
+    );
+
+    private const uint SHGFI_ICON = 0x000000100;
+    private const uint SHGFI_LARGEICON = 0x000000000; // 48x48
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Auto)]
+    private struct SHFILEINFO
+    {
+        public IntPtr hIcon;
+        public int iIcon;
+        public uint dwAttributes;
+
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 260)]
+        public string szDisplayName;
+
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 80)]
+        public string szTypeName;
+    }
+
+    private static BitmapSource? ExtractIconWithShGetFileInfo(string path)
+    {
+        var shfi = new SHFILEINFO();
+        var result = SHGetFileInfo(
+            path,
+            0,
+            ref shfi,
+            (uint)Marshal.SizeOf<SHFILEINFO>(),
+            SHGFI_ICON | SHGFI_LARGEICON
+        );
+
+        if (result != IntPtr.Zero && shfi.hIcon != IntPtr.Zero)
+        {
+            try
+            {
+                var imageSource = Imaging.CreateBitmapSourceFromHIcon(
+                    shfi.hIcon,
+                    Int32Rect.Empty,
+                    BitmapSizeOptions.FromEmptyOptions()
+                );
+                imageSource.Freeze();
+                return imageSource;
+            }
+            finally
+            {
+                NativeMethods.DestroyIcon(shfi.hIcon);
+            }
+        }
+
+        return null;
+    }
+
+    private static class NativeMethods
+    {
+        [DllImport("user32.dll", SetLastError = true)]
+        internal static extern bool DestroyIcon(IntPtr hIcon);
+    }
+
+    /// <summary>Resolves a file name to its full path by searching the directories listed in the PATH environment variable.</summary>
+    /// <param name="fileName">The file name (e.g., "notepad.exe") to resolve.</param>
+    /// <returns>The full path if found, otherwise <see langword="null"/>.</returns>
+    public static string? GetFullPathFromEnvironment(string fileName)
+    {
+        if (File.Exists(fileName))
+            return Path.GetFullPath(fileName);
+
+        var values = Environment.GetEnvironmentVariable("PATH");
+        if (values == null)
+            return null;
+
+        foreach (var path in values.Split(Path.PathSeparator))
+        {
+            var fullPath = Path.Combine(path, fileName);
+            if (File.Exists(fullPath))
+                return fullPath;
+        }
+
+        return null;
+    }
+
+    private (string? FilePath, string? Publisher, string? Description) GetAppInfo(string command)
+    {
+        try
+        {
+            var path = command.Trim('\"');
+            var exeIdx = path.IndexOf(".exe", StringComparison.OrdinalIgnoreCase);
+            if (exeIdx > 0)
+                path = path[..(exeIdx + 4)].Trim('\"', ' ', '\'');
+
+            if (!File.Exists(path))
+                if (!path.Contains('\\') && !path.Contains('/'))
+                    path = GetFullPathFromEnvironment(path);
+
+            if (!string.IsNullOrEmpty(path) && File.Exists(path))
+            {
+                var fvi = FileVersionInfo.GetVersionInfo(path);
+                return (path, fvi.CompanyName, fvi.FileDescription);
+            }
+        }
+        catch
+        {
+            // Ignored, fallback
+        }
+
+        return (null, null, null);
+    }
+}
